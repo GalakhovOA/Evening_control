@@ -91,6 +91,32 @@ def init_db():
         )
     ''')
 
+        # goals (targets) table: stores GOSB and Team goals
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL,              -- 'gosb' | 'team'
+            owner_name TEXT,                 -- for team goals: RTP FI; for gosb goals: NULL
+            title TEXT NOT NULL,
+            metric_type TEXT NOT NULL,        -- 'question' | 'fckp_total' | 'fckp_product'
+            metric_key TEXT NOT NULL,         -- question key or product name
+            target_value REAL NOT NULL,
+            date_from TEXT NOT NULL,          -- YYYY-MM-DD
+            date_to TEXT NOT NULL,            -- YYYY-MM-DD
+            created_at TEXT NOT NULL
+        )
+    ''')
+
+    # leaderboards settings (TOP-N per goal)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS leaderboards (
+            goal_id INTEGER PRIMARY KEY,
+            top_n INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+
+
     conn.commit()
 
     # --- migrations for older DBs ---
@@ -429,6 +455,20 @@ def get_user_name(user_id):
     conn.close()
     return result[0] if result else None
 
+def get_user_names_by_ids(user_ids):
+    """Return dict {user_id: name} for given list of user_ids."""
+    ids = [int(x) for x in (user_ids or []) if str(x).strip()]
+    if not ids:
+        return {}
+    conn = get_conn()
+    cur = conn.cursor()
+    q = ','.join(['?'] * len(ids))
+    cur.execute(f"SELECT user_id, name FROM users WHERE user_id IN ({q})", tuple(ids))
+    rows = cur.fetchall()
+    conn.close()
+    return {int(uid): name for uid, name in rows}
+
+
 
 def set_user_name(user_id, name):
     conn = get_conn()
@@ -526,6 +566,269 @@ def get_employees(manager_fi=None):
     conn.close()
     return results
 
+
+
+# =============================
+# GOALS (TARGETS)
+# =============================
+def _iso_today() -> str:
+    return datetime.now().strftime('%Y-%m-%d')
+
+
+def cleanup_expired_goals(today: str = None) -> int:
+    'Delete goals whose date_to is strictly before today (YYYY-MM-DD). Returns number deleted.'
+    today = today or _iso_today()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM goals WHERE date_to < ?", (today,))
+    ids = [int(r[0]) for r in cur.fetchall()]
+    if ids:
+        q = ','.join(['?'] * len(ids))
+        # remove leaderboard settings too
+        try:
+            cur.execute(f"DELETE FROM leaderboards WHERE goal_id IN ({q})", tuple(ids))
+        except Exception:
+            pass
+        cur.execute(f"DELETE FROM goals WHERE id IN ({q})", tuple(ids))
+    conn.commit()
+    conn.close()
+    return len(ids)
+
+
+def add_goal(scope: str,
+             title: str,
+             metric_type: str,
+             metric_key: str,
+             target_value: float,
+             date_from: str,
+             date_to: str,
+             owner_name: str = None) -> int:
+    scope = (scope or "").strip().lower()
+    metric_type = (metric_type or "").strip().lower()
+    title = (title or "").strip()
+    metric_key = (metric_key or "").strip()
+
+    if scope not in ("gosb", "team"):
+        raise ValueError("invalid scope")
+    if metric_type not in ("question", "fckp_total", "fckp_product"):
+        raise ValueError("invalid metric_type")
+    if not title:
+        raise ValueError("title required")
+    if not metric_key:
+        raise ValueError("metric_key required")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO goals (scope, owner_name, title, metric_type, metric_key, target_value, date_from, date_to, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            scope,
+            owner_name,
+            title,
+            metric_type,
+            metric_key,
+            float(target_value or 0),
+            date_from,
+            date_to,
+            datetime.now().isoformat(timespec='seconds'),
+        )
+    )
+    conn.commit()
+    goal_id = int(cur.lastrowid)
+    conn.close()
+    return goal_id
+
+
+def get_goal(goal_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, scope, owner_name, title, metric_type, metric_key, target_value, date_from, date_to, created_at "
+        "FROM goals WHERE id = ?",
+        (int(goal_id),)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "scope": row[1],
+        "owner_name": row[2],
+        "title": row[3],
+        "metric_type": row[4],
+        "metric_key": row[5],
+        "target_value": row[6],
+        "date_from": row[7],
+        "date_to": row[8],
+        "created_at": row[9],
+    }
+
+
+def list_goals(scope: str, owner_name: str = None, include_expired: bool = False, today: str = None):
+    scope = (scope or "").strip().lower()
+    today = today or _iso_today()
+    conn = get_conn()
+    cur = conn.cursor()
+
+    params = [scope]
+    q = (
+        "SELECT id, scope, owner_name, title, metric_type, metric_key, target_value, date_from, date_to, created_at "
+        "FROM goals WHERE scope = ?"
+    )
+    if scope == 'team':
+        q += " AND owner_name = ?"
+        params.append(owner_name)
+    if not include_expired:
+        q += " AND date_to >= ?"
+        params.append(today)
+    q += " ORDER BY date_to ASC, id ASC"
+
+    cur.execute(q, tuple(params))
+    rows = cur.fetchall()
+    conn.close()
+
+    res = []
+    for row in rows:
+        res.append({
+            "id": row[0],
+            "scope": row[1],
+            "owner_name": row[2],
+            "title": row[3],
+            "metric_type": row[4],
+            "metric_key": row[5],
+            "target_value": row[6],
+            "date_from": row[7],
+            "date_to": row[8],
+            "created_at": row[9],
+        })
+    return res
+
+
+def update_goal(goal_id: int, **fields) -> bool:
+    allowed = {"title", "metric_type", "metric_key", "target_value", "date_from", "date_to"}
+    sets = []
+    params = []
+    for k, v in (fields or {}).items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k} = ?")
+        if k == 'target_value':
+            params.append(float(v or 0))
+        else:
+            params.append(v)
+    if not sets:
+        return False
+    params.append(int(goal_id))
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE goals SET {', '.join(sets)} WHERE id = ?", tuple(params))
+    conn.commit()
+    changed = cur.rowcount > 0
+    conn.close()
+    return changed
+
+
+def delete_goal(goal_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM leaderboards WHERE goal_id = ?", (int(goal_id),))
+    except Exception:
+        pass
+    cur.execute("DELETE FROM goals WHERE id = ?", (int(goal_id),))
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+
+
+# =============================
+# LEADERBOARDS (TOP employees per goal)
+# =============================
+
+def get_goal_leaderboard_top_n(goal_id: int) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT top_n FROM leaderboards WHERE goal_id = ?", (int(goal_id),))
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    conn.close()
+    try:
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return 0
+
+
+def set_goal_leaderboard(goal_id: int, top_n: int) -> None:
+    top_n = int(top_n)
+    if top_n <= 0:
+        delete_goal_leaderboard(goal_id)
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    cur.execute(
+        "INSERT OR REPLACE INTO leaderboards (goal_id, top_n, updated_at) VALUES (?, ?, ?)",
+        (int(goal_id), int(top_n), now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_goal_leaderboard(goal_id: int) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM leaderboards WHERE goal_id = ?", (int(goal_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_leaderboards() -> dict:
+    """Return dict {goal_id: top_n} for all configured leaderboards."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT goal_id, top_n FROM leaderboards")
+        rows = cur.fetchall()
+    except Exception:
+        rows = []
+    conn.close()
+    out = {}
+    for gid, n in rows:
+        try:
+            out[int(gid)] = int(n)
+        except Exception:
+            pass
+    return out
+def get_mkk_reports_between(date_from: str, date_to: str):
+    'Returns list of tuples: (user_id, report_date, report_dict, current_manager_fi).'
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT r.user_id, r.report_date, r.report_data, u.manager_fi "
+        "FROM reports r JOIN users u ON u.user_id = r.user_id "
+        "WHERE u.role = 'mkk' AND r.report_date BETWEEN ? AND ?",
+        (date_from, date_to)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    out = []
+    for uid, rdate, rdata, mfi in rows:
+        try:
+            data = json.loads(rdata) if rdata else {}
+        except Exception:
+            data = {}
+        out.append((uid, rdate, data, mfi))
+    return out
 
 # =============================
 # RTP COMBINED

@@ -26,6 +26,7 @@ if not TOKEN:
 
 user_states = {}
 
+
 def sync_runtime_config():
     """Load dynamic lists (questions/RTP/FCKP options) from DB settings if present."""
     # Questions for MKK report
@@ -64,21 +65,24 @@ def safe_state(uid):
         user_states[uid] = st
     return st
 
+
 def build_main_menu():
     kb = [
-        [InlineKeyboardButton("Отчет МКК", callback_data='role_mkk')],
-        [InlineKeyboardButton("Отчеты РТП", callback_data='role_rtp')],
-        [InlineKeyboardButton("Отчеты РМ/МН", callback_data='role_rm')],
+        [InlineKeyboardButton("👥 Отчет МКК", callback_data='role_mkk')],
+        [InlineKeyboardButton("👤 РТП", callback_data='role_rtp')],
+        [InlineKeyboardButton("🏢 УПМБ", callback_data='role_rm')],
         [InlineKeyboardButton("🛠 Администрирование", callback_data='role_admin')],
         [InlineKeyboardButton("Сменить ФИ/РТП", callback_data='change_info')]
     ]
     return InlineKeyboardMarkup(kb)
+
 
 def sanitize_sheet_title(title: str) -> str:
     """Excel sheet titles must be <=31 chars and cannot contain : \ / ? * [ ]"""
     title = re.sub(r'[:\\/?*\[\]]', '_', str(title or '').strip())
     title = title.strip() or "Sheet1"
     return title[:31]
+
 
 def sanitize_filename(name: str, default_base: str = "report") -> str:
     """Make a safe filename for Telegram documents."""
@@ -108,6 +112,269 @@ async def send_or_edit(target, text: str, reply_markup=None):
             return await target.message.reply_text(text, reply_markup=reply_markup)
     except Exception:
         return None
+
+
+# --- GOALS helpers ---
+
+def _today_iso() -> str:
+    return datetime.now().strftime('%Y-%m-%d')
+
+
+def _iso_to_ru(d: str) -> str:
+    try:
+        return datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m.%Y')
+    except Exception:
+        return str(d or '')
+
+
+def _parse_date_to_iso(s: str) -> str:
+    s = (s or '').strip()
+    if not s:
+        raise ValueError('empty')
+    low = s.lower()
+    if low in ('сегодня', 'today'):
+        return _today_iso()
+    for fmt in ('%d.%m.%Y', '%Y-%m-%d', '%d/%m/%Y'):
+        try:
+            return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    raise ValueError('bad date format')
+
+
+def _to_float(v) -> float:
+    try:
+        if v is None or v == '':
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        return float(str(v).replace(',', '.').strip())
+    except Exception:
+        return 0.0
+
+
+def _metric_label(metric_type: str, metric_key: str) -> str:
+    metric_type = (metric_type or '').lower()
+    if metric_type == 'question':
+        for q in getattr(config, 'QUESTIONS', []):
+            if q.get('key') == metric_key:
+                return (q.get('question') or metric_key).strip()
+        return str(metric_key)
+    if metric_type == 'fckp_total':
+        return 'ФЦКП (всего)'
+    if metric_type == 'fckp_product':
+        return f"ФЦКП: {metric_key}"
+    return str(metric_key)
+
+
+def _compute_goal_achieved(goal: dict, today_iso: str = None) -> float:
+    today_iso = today_iso or _today_iso()
+    date_from = goal.get('date_from') or today_iso
+    date_to = goal.get('date_to') or today_iso
+    end = min(today_iso, date_to)
+    if end < date_from:
+        return 0.0
+
+    scope = (goal.get('scope') or '').lower()
+    owner = goal.get('owner_name')
+    metric_type = (goal.get('metric_type') or '').lower()
+    metric_key = goal.get('metric_key')
+
+    try:
+        rows = database.get_mkk_reports_between(date_from, end)
+    except Exception:
+        rows = []
+
+    achieved = 0.0
+    for uid, rdate, data, current_mfi in rows:
+        if not isinstance(data, dict):
+            continue
+        if scope == 'team':
+            snap = data.get('manager_fi_snapshot') or current_mfi
+            if snap != owner:
+                continue
+
+        if metric_type == 'question':
+            achieved += _to_float(data.get(metric_key, 0))
+        elif metric_type == 'fckp_total':
+            prods = data.get('fckp_products')
+            if isinstance(prods, list):
+                achieved += float(len(prods))
+            else:
+                achieved += _to_float(data.get('fckp_realized', 0))
+        elif metric_type == 'fckp_product':
+            prods = data.get('fckp_products')
+            if isinstance(prods, list):
+                achieved += float(sum(1 for p in prods if str(p) == str(metric_key)))
+    return achieved
+
+
+def _compute_goal_user_scores(goal: dict, today_iso: str = None) -> dict:
+    """Return dict {user_id: achieved} for the goal period up to today."""
+    today_iso = today_iso or _today_iso()
+    date_from = goal.get('date_from') or today_iso
+    date_to = goal.get('date_to') or today_iso
+    end = min(today_iso, date_to)
+    if end < date_from:
+        return {}
+
+    scope = (goal.get('scope') or '').lower()
+    owner = goal.get('owner_name')
+    metric_type = (goal.get('metric_type') or '').lower()
+    metric_key = goal.get('metric_key')
+
+    try:
+        rows = database.get_mkk_reports_between(date_from, end)
+    except Exception:
+        rows = []
+
+    scores = {}
+    for uid, rdate, data, current_mfi in rows:
+        if not isinstance(data, dict):
+            continue
+        if scope == 'team':
+            snap = data.get('manager_fi_snapshot') or current_mfi
+            if snap != owner:
+                continue
+
+        add = 0.0
+        if metric_type == 'question':
+            add = _to_float(data.get(metric_key, 0))
+        elif metric_type == 'fckp_total':
+            prods = data.get('fckp_products')
+            if isinstance(prods, list):
+                add = float(len(prods))
+            else:
+                add = _to_float(data.get('fckp_realized', 0))
+        elif metric_type == 'fckp_product':
+            prods = data.get('fckp_products')
+            if isinstance(prods, list):
+                add = float(sum(1 for p in prods if str(p) == str(metric_key)))
+
+        if add > 0:
+            scores[int(uid)] = scores.get(int(uid), 0.0) + float(add)
+
+    return scores
+
+
+def _format_goal_leaderboard_lines(goal: dict, top_n: int, today_iso: str = None) -> list:
+    """Return formatted leaderboard lines for a goal (only users with >0 progress)."""
+    top_n = int(top_n or 0)
+    if top_n <= 0:
+        return []
+
+    scores = _compute_goal_user_scores(goal, today_iso=today_iso)
+    items = [(uid, val) for uid, val in scores.items() if float(val) > 0]
+    if not items:
+        return []
+
+    items.sort(key=lambda x: (-float(x[1]), int(x[0])))
+    items = items[:top_n]
+
+    try:
+        names = database.get_user_names_by_ids([uid for uid, _ in items])
+    except Exception:
+        names = {}
+
+    medals = ['🥇', '🥈', '🥉']
+    lines = []
+    for i, (uid, val) in enumerate(items):
+        icon = medals[i] if i < 3 else '🔥'
+        fio = names.get(int(uid)) or str(uid)
+        lines.append(f"  {icon} {fio} — {config.format_value(val)}")
+    return lines
+
+
+def _format_goal_short(goal: dict, achieved: float) -> str:
+    target = _to_float(goal.get('target_value', 0))
+    remaining = max(0.0, target - achieved)
+    due = _iso_to_ru(goal.get('date_to'))
+    title = (goal.get('title') or '').strip()
+    a = config.format_value(achieved)
+    t = config.format_value(target)
+    r = config.format_value(remaining)
+    return f"• {title}: {a}/{t} (осталось {r}) до {due}"
+
+
+def _start_goals_block(uid: int) -> str:
+    today = _today_iso()
+    try:
+        database.cleanup_expired_goals(today)
+    except Exception:
+        pass
+
+    lines = []
+
+    try:
+        gosb = database.list_goals('gosb', today=today)
+    except Exception:
+        gosb = []
+
+    if gosb:
+        lines.append('🎯 Цели ГОСБ:')
+        for g in gosb[:3]:
+            achieved = _compute_goal_achieved(g, today)
+            lines.append(_format_goal_short(g, achieved))
+            # Optional TOP employees for this goal
+            try:
+                top_n = database.get_goal_leaderboard_top_n(int(g.get('id')))
+            except Exception:
+                top_n = 0
+            lb_lines = _format_goal_leaderboard_lines(g, top_n, today_iso=today) if top_n else []
+            if lb_lines:
+                lines.extend(lb_lines)
+        if len(gosb) > 3:
+            lines.append(f"… и ещё {len(gosb) - 3} целей")
+
+    owner = None
+    try:
+        role = database.get_user_role(uid)
+    except Exception:
+        role = None
+
+    try:
+        if role == 'rtp':
+            owner = database.get_user_name(uid)
+        else:
+            owner = database.get_manager_fi_for_employee(uid)
+    except Exception:
+        owner = None
+
+    if owner:
+        try:
+            team = database.list_goals('team', owner_name=owner, today=today)
+        except Exception:
+            team = []
+        if team:
+            lines.append('')
+            lines.append(f"👥 Цели команды ({owner}):")
+            for g in team[:3]:
+                achieved = _compute_goal_achieved(g, today)
+                lines.append(_format_goal_short(g, achieved))
+                # Optional TOP employees for this goal
+                try:
+                    top_n = database.get_goal_leaderboard_top_n(int(g.get('id')))
+                except Exception:
+                    top_n = 0
+                lb_lines = _format_goal_leaderboard_lines(g, top_n, today_iso=today) if top_n else []
+                if lb_lines:
+                    lines.extend(lb_lines)
+            if len(team) > 3:
+                lines.append(f"… и ещё {len(team) - 3} целей")
+
+    return '\n'.join(lines).strip()
+
+
+def _metric_picker_keyboard():
+    kb = []
+    for q in getattr(config, 'QUESTIONS', []):
+        label = (q.get('question') or q.get('key') or '').strip()[:64]
+        kb.append([InlineKeyboardButton(label, callback_data=f"goal_metric_q_{q.get('key')}")])
+    kb.append([InlineKeyboardButton('ФЦКП (всего)', callback_data='goal_metric_fckp_total')])
+    for p in getattr(config, 'FCKP_OPTIONS', []):
+        kb.append([InlineKeyboardButton(f"ФЦКП: {p}", callback_data=f"goal_metric_fckp_prod_{p}")])
+    kb.append([InlineKeyboardButton('⬅️ Назад', callback_data='goal_cancel_metric')])
+    return InlineKeyboardMarkup(kb)
 
 
 # --- Helpers for xlsx generation (used by RM) ---
@@ -145,7 +412,10 @@ def generate_xlsx_for_report(title: str, rows: list, columns: list):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sync_runtime_config()
     msg = update.message or update.effective_message
-    await msg.reply_text("Выберите роль:", reply_markup=build_main_menu())
+    block = _start_goals_block(msg.from_user.id)
+    text = (block + "\n\n" if block else "") + "Выберите роль:"
+    await msg.reply_text(text, reply_markup=build_main_menu())
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -156,6 +426,144 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     st = user_states.get(uid, {})
     sync_runtime_config()
+
+    # GOAL callbacks
+    if data == 'goal_cancel_metric':
+        gs = (st or {}).get('goal_scope')
+        if gs == 'team':
+            await show_goals_menu(query, uid, scope='team', owner_name=(st or {}).get('goal_owner'), back_cb='rtp_menu')
+        else:
+            await show_goals_menu(query, uid, scope='gosb', back_cb='rm_management')
+        return
+
+    if data.startswith('goal_metric_'):
+        st2 = safe_state(uid)
+        if st2.get('mode') != 'goal_pick_metric':
+            return
+        metric_type = None
+        metric_key = None
+        if data.startswith('goal_metric_q_'):
+            metric_type = 'question'
+            metric_key = data.split('goal_metric_q_', 1)[1]
+        elif data == 'goal_metric_fckp_total':
+            metric_type = 'fckp_total'
+            metric_key = 'fckp_total'
+        elif data.startswith('goal_metric_fckp_prod_'):
+            metric_type = 'fckp_product'
+            metric_key = data.split('goal_metric_fckp_prod_', 1)[1]
+
+        if not metric_type or not metric_key:
+            await send_or_edit(query, 'Ошибка выбора показателя.')
+            return
+
+        action = st2.get('goal_action')
+        scope = st2.get('goal_scope')
+        owner = st2.get('goal_owner')
+
+        if action == 'add':
+            st2['goal_metric_type'] = metric_type
+            st2['goal_metric_key'] = metric_key
+            st2['mode'] = 'goal_add_target'
+            await send_or_edit(query, 'Введите целевое значение (число):', reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton('⬅️ Назад', callback_data=f"{scope}_goals_menu")]]))
+            return
+
+        if action == 'edit_metric':
+            goal_id = st2.get('goal_id')
+            try:
+                database.update_goal(int(goal_id), metric_type=metric_type, metric_key=metric_key)
+            except Exception:
+                pass
+            await show_goal_edit_menu(query, uid, scope=scope, goal_id=goal_id, owner_name=owner)
+            return
+        return
+
+    if data.startswith('goal_add_'):
+        scope = data.split('_', 2)[2]
+        st2 = safe_state(uid)
+        st2.clear()
+        st2.update({'mode': 'goal_add_title', 'goal_scope': scope, 'editing': False})
+        if scope == 'team':
+            st2['goal_owner'] = database.get_user_name(uid)
+        await send_or_edit(query, 'Введите название цели:', reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton('⬅️ Назад', callback_data=f"{scope}_goals_menu")]]))
+        return
+
+    if data.startswith('goal_edit_') and data.count('_') == 3:
+        _, _, scope, gid = data.split('_', 3)
+        st2 = safe_state(uid)
+        st2['goal_scope'] = scope
+        st2['goal_owner'] = database.get_user_name(uid) if scope == 'team' else None
+        await show_goal_edit_menu(query, uid, scope=scope, goal_id=int(gid), owner_name=st2.get('goal_owner'))
+        return
+
+    if data.startswith('goal_editfield_'):
+        parts = data.split('_')
+        if len(parts) < 5:
+            return
+        scope = parts[2]
+        gid = int(parts[3])
+        field = parts[4]
+        st2 = safe_state(uid)
+        st2['goal_scope'] = scope
+        st2['goal_id'] = gid
+        if scope == 'team':
+            st2['goal_owner'] = database.get_user_name(uid)
+
+        if field == 'metric':
+            st2['mode'] = 'goal_pick_metric'
+            st2['goal_action'] = 'edit_metric'
+            await send_or_edit(query, 'Выберите показатель:', reply_markup=_metric_picker_keyboard())
+            return
+
+        if field in ('title', 'target', 'date_from', 'date_to'):
+            st2['mode'] = f"goal_edit_{field}"
+            prompt = {
+                'title': 'Введите новое название цели:',
+                'target': 'Введите новое целевое значение (число):',
+                'date_from': 'Введите новую дату начала (ДД.ММ.ГГГГ) или YYYY-MM-DD:',
+                'date_to': 'Введите новую дату окончания (ДД.ММ.ГГГГ) или YYYY-MM-DD:',
+            }.get(field, 'Введите значение:')
+            await send_or_edit(query, prompt, reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton('⬅️ Назад', callback_data=f"goal_edit_{scope}_{gid}")]]))
+            return
+        return
+
+    if data.startswith('goal_del_'):
+        parts = data.split('_')
+        if len(parts) < 4:
+            return
+        scope = parts[2]
+        gid = int(parts[3])
+        g = None
+        try:
+            g = database.get_goal(gid)
+        except Exception:
+            g = None
+        title = (g or {}).get('title') or f"#{gid}"
+        kb = [[
+            InlineKeyboardButton('✅ Да, удалить', callback_data=f"goal_delconfirm_{scope}_{gid}"),
+            InlineKeyboardButton('⬅️ Нет', callback_data=f"goal_edit_{scope}_{gid}")
+        ]]
+        await send_or_edit(query, f"Удалить цель {title}?", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data.startswith('goal_delconfirm_'):
+        parts = data.split('_')
+        if len(parts) < 4:
+            return
+        scope = parts[2]
+        gid = int(parts[3])
+        try:
+            database.delete_goal(gid)
+        except Exception:
+            pass
+        if scope == 'team':
+            owner = database.get_user_name(uid)
+            await show_goals_menu(query, uid, scope='team', owner_name=owner, back_cb='rtp_menu')
+        else:
+            await show_goals_menu(query, uid, scope='gosb', back_cb='rm_management')
+        return
 
     # return to main
     if data == 'return_to_menu':
@@ -182,7 +590,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == 'admin_fckp_add':
         user_states[uid] = {'mode': 'admin_fckp_add'}
-        await send_or_edit(query, "Введите название новой кнопки ЦКП:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data='admin_edit_fckp')]]))
+        await send_or_edit(query, "Введите название новой кнопки ЦКП:", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data='admin_edit_fckp')]]))
         return
 
     if data.startswith('admin_fckp_edit_'):
@@ -192,7 +601,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_or_edit(query, "Ошибка выбора элемента.")
             return
         user_states[uid] = {'mode': 'admin_fckp_edit', 'fckp_idx': idx}
-        await send_or_edit(query, "Введите новое название кнопки ЦКП:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data='admin_edit_fckp')]]))
+        await send_or_edit(query, "Введите новое название кнопки ЦКП:", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data='admin_edit_fckp')]]))
         return
 
     if data.startswith('admin_fckp_del_'):
@@ -218,14 +628,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         opts = get_fckp_options()
         if direction == 'up' and 0 < idx < len(opts):
-            opts[idx-1], opts[idx] = opts[idx], opts[idx-1]
+            opts[idx - 1], opts[idx] = opts[idx], opts[idx - 1]
             save_fckp_options(opts)
-        if direction == 'down' and 0 <= idx < len(opts)-1:
-            opts[idx+1], opts[idx] = opts[idx], opts[idx+1]
+        if direction == 'down' and 0 <= idx < len(opts) - 1:
+            opts[idx + 1], opts[idx] = opts[idx], opts[idx + 1]
             save_fckp_options(opts)
         await show_admin_fckp_editor(query)
         return
-
 
     if data == 'admin_questions_add':
         user_states[uid] = {'mode': 'admin_questions_add'}
@@ -363,8 +772,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_employees_list(query, from_idx)
         return
 
-
-
     if data == 'admin_rtp_add':
         user_states[uid] = {'mode': 'admin_rtp_add'}
         try:
@@ -469,7 +876,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await query.message.reply_text("Введите новый пароль для входа РТП:")
         return
-
 
     # role selection (common)
     if data.startswith('role_'):
@@ -580,7 +986,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = st.get('name')
         if name:
             database.add_user(uid, 'mkk', name, selected)
-            st.pop('choosing_rtp', None); st.pop('name', None)
+            st.pop('choosing_rtp', None);
+            st.pop('name', None)
             st.update({'step': 0, 'data': {}, 'editing': False, 'mode': 'mkk'})
             await query.edit_message_text(f"Привязка к {selected} успешна. Начинаем отчёт.")
             await ask_next_question(query.message, uid)
@@ -604,11 +1011,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         database.add_user(uid, 'rm', chosen)
         database.set_user_verified(uid, 1)
         user_states[uid] = {'mode': 'rm', 'step': 0, 'data': {}, 'editing': False}
-        kb = [
-            [InlineKeyboardButton("Список РТП", callback_data='rm_show_rtps')],
-            [InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')]
-        ]
-        await query.edit_message_text(f"Вы вошли как РМ/МН: {chosen}", reply_markup=InlineKeyboardMarkup(kb))
+        await show_rm_home(query, uid)
         return
 
     # role_rm -> show RM menu (entry)
@@ -624,6 +1027,110 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("Введите пароль для доступа в раздел руководителя:")
             return
 
+    if data == 'rm_menu':
+        await show_rm_home(query, uid)
+        return
+
+    if data == 'rm_management':
+        await show_rm_management_menu(query, uid)
+        return
+
+    if data == 'gosb_goals_menu':
+        await show_goals_menu(query, uid, scope='gosb', back_cb='rm_management')
+        return
+
+    if data == 'gosb_leaderboards_menu':
+        await show_leaderboards_menu(query, uid, scope='gosb', back_cb='rm_management')
+        return
+
+    if data == 'team_leaderboards_menu':
+        try:
+            owner = database.get_user_name(uid)
+        except Exception:
+            owner = None
+        if not owner:
+            await send_or_edit(query, 'Не удалось определить РТП для целей команды.')
+            return
+        await show_leaderboards_menu(query, uid, scope='team', owner_name=owner, back_cb='rtp_menu')
+        return
+
+    if data.startswith('lb_cfg_'):
+        # lb_cfg_{scope}_{goal_id}
+        try:
+            parts = data.split('_')
+            scope = parts[2]
+            gid = int(parts[3])
+        except Exception:
+            await send_or_edit(query, 'Ошибка выбора цели.')
+            return
+        owner = None
+        if scope == 'team':
+            try:
+                owner = database.get_user_name(uid)
+            except Exception:
+                owner = None
+            if not owner:
+                await send_or_edit(query, 'Не удалось определить РТП.')
+                return
+            # ensure goal belongs to this RTP
+            try:
+                g = database.get_goal(gid)
+            except Exception:
+                g = None
+            if not g or (g.get('owner_name') != owner):
+                await send_or_edit(query, 'Цель недоступна.')
+                return
+        await show_leaderboard_goal_config(query, uid, scope=scope, goal_id=gid, owner_name=owner)
+        return
+
+    if data.startswith('lb_setn_'):
+        # lb_setn_{scope}_{goal_id}_{n}
+        try:
+            parts = data.split('_')
+            scope = parts[2]
+            gid = int(parts[3])
+            n = int(parts[4])
+        except Exception:
+            await send_or_edit(query, 'Ошибка настройки ТОП.')
+            return
+        try:
+            database.set_goal_leaderboard(gid, n)
+        except Exception as e:
+            await send_or_edit(query, f'Ошибка сохранения: {e}')
+            return
+        await show_leaderboard_goal_config(query, uid, scope=scope, goal_id=gid)
+        return
+
+    if data.startswith('lb_off_'):
+        try:
+            parts = data.split('_')
+            scope = parts[2]
+            gid = int(parts[3])
+        except Exception:
+            await send_or_edit(query, 'Ошибка отключения ТОП.')
+            return
+        try:
+            database.delete_goal_leaderboard(gid)
+        except Exception:
+            pass
+        await show_leaderboard_goal_config(query, uid, scope=scope, goal_id=gid)
+        return
+
+    if data.startswith('lb_enter_'):
+        try:
+            parts = data.split('_')
+            scope = parts[2]
+            gid = int(parts[3])
+        except Exception:
+            await send_or_edit(query, 'Ошибка ввода.')
+            return
+        stx = safe_state(uid)
+        stx['mode'] = 'lb_input_n'
+        stx['lb_scope'] = scope
+        stx['lb_goal_id'] = gid
+        await send_or_edit(query, 'Введите число сотрудников для ТОП (например 5).\n\nОтмена — напишите: отмена')
+        return
+
     # RM menu interactions
     if data == 'rm_show_rtps':
         date = datetime.now().strftime('%Y-%m-%d')
@@ -634,7 +1141,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb.append([InlineKeyboardButton(f"{fi} {status}", callback_data=f"rm_choose_rtp_{i}")])
         kb.append([InlineKeyboardButton("Объединить все РТП (глобально) и скачать", callback_data='rm_combine_all')])
         kb.append([InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')])
-        await query.edit_message_text("Список РТП (статус отправки объединённого отчёта):", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text("Список РТП (статус отправки объединённого отчёта):",
+                                      reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data.startswith('rm_choose_rtp_'):
@@ -651,7 +1159,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date = datetime.now().strftime('%Y-%m-%d')
         combined = database.get_rtp_combined(chosen, date)
         if not combined:
-            await query.edit_message_text(f"РТП {chosen} не отправлял объединённый отчёт на {date}.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data='rm_show_rtps')]]))
+            await query.edit_message_text(f"РТП {chosen} не отправлял объединённый отчёт на {date}.",
+                                          reply_markup=InlineKeyboardMarkup(
+                                              [[InlineKeyboardButton("Назад", callback_data='rm_show_rtps')]]))
             return
         text = f"Объединённый отчёт РТП {chosen} на {date}:\n\n{config.format_report(combined)}"
         kb = [
@@ -665,7 +1175,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date = datetime.now().strftime('%Y-%m-%d')
         all_combined = database.get_all_rtp_combined_on_date(date)
         if not all_combined:
-            await query.edit_message_text(f"Нет объединённых отчётов от РТП на {date}.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data='rm_show_rtps')]]))
+            await query.edit_message_text(f"Нет объединённых отчётов от РТП на {date}.",
+                                          reply_markup=InlineKeyboardMarkup(
+                                              [[InlineKeyboardButton("Назад", callback_data='rm_show_rtps')]]))
             return
         aggregated = {}
         fckp_products = []
@@ -757,6 +1269,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("Введите пароль для доступа в раздел РТП:")
             return
 
+    if data == 'team_goals_menu':
+        owner = database.get_user_name(uid)
+        await show_goals_menu(query, uid, scope='team', owner_name=owner, back_cb='rtp_menu')
+        return
+
     # RTP manager actions
     if data == 'rtp_menu':
         await show_manager_menu(query)
@@ -767,12 +1284,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         manager_fi = database.get_user_name(uid)
         employees = database.get_employees(manager_fi)
         reports = database.get_all_reports_on_date(date, manager_fi)
-        reported_ids = [u for u,_ in reports]
+        reported_ids = [u for u, _ in reports]
         text = f"Отчеты на {date}:\n"
         for u_id, name in employees:
             status = '✅' if u_id in reported_ids else '❌'
             text += f"Сотрудник {name or str(u_id)}: {status}\n"
-        kb = [[InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')], [InlineKeyboardButton("Назад", callback_data='rtp_menu')]]
+        kb = [[InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')],
+              [InlineKeyboardButton("Назад", callback_data='rtp_menu')]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
         return
 
@@ -793,7 +1311,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         manager_fi = database.get_user_name(uid)
         reports = database.get_all_reports_on_date(date, manager_fi)
         if not reports:
-            await query.edit_message_text("Нет отчетов на сегодня.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data='rtp_menu')]]))
+            await query.edit_message_text("Нет отчетов на сегодня.", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Назад", callback_data='rtp_menu')]]))
             return
         combined = {}
         fckp_products = []
@@ -821,7 +1340,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date = datetime.now().strftime('%Y-%m-%d')
         reports = database.get_all_reports_on_date(date, manager_fi)
         if not reports:
-            await query.edit_message_text("Нет отчетов для объединения/отправки.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data='rtp_menu')]]))
+            await query.edit_message_text("Нет отчетов для объединения/отправки.", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Назад", callback_data='rtp_menu')]]))
             return
         combined = {}
         fckp_products = []
@@ -866,10 +1386,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_next_question(query.message, uid)
         return
 
-
     # FCKP product picking
     if data.startswith('fckp_prod_'):
-        prod = data.split('fckp_prod_',1)[1]
+        prod = data.split('fckp_prod_', 1)[1]
         st = safe_state(uid)
         st.setdefault('fckp_products', [])
         st['fckp_products'].append(prod)
@@ -878,7 +1397,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if left > 0:
             kb = [[InlineKeyboardButton(p, callback_data=f"fckp_prod_{p}")] for p in config.FCKP_OPTIONS]
             try:
-                await query.edit_message_text(f"Вы выбрали {prod}. Осталось указать ещё {left} ФЦКП.", reply_markup=InlineKeyboardMarkup(kb))
+                await query.edit_message_text(f"Вы выбрали {prod}. Осталось указать ещё {left} ФЦКП.",
+                                              reply_markup=InlineKeyboardMarkup(kb))
             except Exception:
                 pass
             return
@@ -889,7 +1409,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Все ФЦКП указаны ✅")
             except Exception:
                 pass
-            st['step'] = st.get('step',0) + 1
+            st['step'] = st.get('step', 0) + 1
             await ask_next_question(query.message, uid)
             return
 
@@ -911,10 +1431,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows.append({'key': q['question'], 'value': rpt.get(q['key'], 0)})
         prod_counts = {}
         for p in rpt.get('fckp_products', []):
-            prod_counts[p] = prod_counts.get(p,0) + 1
+            prod_counts[p] = prod_counts.get(p, 0) + 1
         for prod in config.FCKP_OPTIONS:
-            rows.append({'key': prod, 'value': prod_counts.get(prod,0)})
-        cols = [('key','Поле'), ('value','Значение')]
+            rows.append({'key': prod, 'value': prod_counts.get(prod, 0)})
+        cols = [('key', 'Поле'), ('value', 'Значение')]
         try:
             bio = generate_xlsx_for_report(f"user_{target_uid}_{date}", rows, cols)
             filename = sanitize_filename(f"user_{target_uid}_{date}.xlsx", default_base="user_report")
@@ -926,7 +1446,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'edit_report':
         await start_edit_report(query, uid)
         return
-
 
     if data == 'send_report':
         success, msg_text = await send_personal_report_to_manager(uid, context)
@@ -945,6 +1464,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # fallback
     return
 
+
 # role selection helper
 async def handle_role_selection(query_or_message, user_id, role):
     name = database.get_user_name(user_id)
@@ -952,7 +1472,7 @@ async def handle_role_selection(query_or_message, user_id, role):
         await show_admin_menu(query_or_message)
         return
     if role == 'rtp':
-        kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i,fi in enumerate(config.RTP_LIST)]
+        kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i, fi in enumerate(config.RTP_LIST)]
         kb.append([InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')])
         try:
             await query_or_message.edit_message_text("Выберите ваше ФИ (РТП):", reply_markup=InlineKeyboardMarkup(kb))
@@ -1005,8 +1525,9 @@ async def handle_role_selection(query_or_message, user_id, role):
                     pass
             return
 
+
 async def show_rtp_buttons(query_or_message, text):
-    kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i,fi in enumerate(config.RTP_LIST)]
+    kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i, fi in enumerate(config.RTP_LIST)]
     kb.append([InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')])
     try:
         await query_or_message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
@@ -1016,11 +1537,13 @@ async def show_rtp_buttons(query_or_message, text):
         except Exception:
             pass
 
+
 async def show_manager_menu(q):
     kb = [
         [InlineKeyboardButton("Показать отчеты на дату", callback_data='rtp_show_reports')],
         [InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')],
         [InlineKeyboardButton("Объединить и показать отчеты на дату", callback_data='rtp_combine_reports')],
+        [InlineKeyboardButton("🎯 Цели команды", callback_data='team_goals_menu')],
         [InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')]
     ]
     try:
@@ -1030,6 +1553,183 @@ async def show_manager_menu(q):
             await q.message.reply_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(kb))
         except Exception:
             pass
+
+
+async def show_rm_home(target, uid: int):
+    name = None
+    try:
+        name = database.get_user_name(uid)
+    except Exception:
+        name = None
+    kb = [
+        [InlineKeyboardButton('Список РТП', callback_data='rm_show_rtps')],
+        [InlineKeyboardButton('🏢 Управление', callback_data='rm_management')],
+        [InlineKeyboardButton('Вернуться в меню', callback_data='return_to_menu')]
+    ]
+    await send_or_edit(target, f"Меню РМ/МН{f' ({name})' if name else ''}:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def show_rm_management_menu(target, uid: int):
+    kb = [
+        [InlineKeyboardButton('🎯 Цели ГОСБ', callback_data='gosb_goals_menu')],
+        [InlineKeyboardButton('🏆 Лучшие сотрудники', callback_data='gosb_leaderboards_menu')],
+        [InlineKeyboardButton('⬅️ Назад', callback_data='rm_menu')]
+    ]
+    await send_or_edit(target, 'Управление:', reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def show_leaderboards_menu(target, uid: int, scope: str, owner_name: str = None, back_cb: str = 'return_to_menu'):
+    """Configure TOP employees per goal."""
+    today = _today_iso()
+    try:
+        database.cleanup_expired_goals(today)
+    except Exception:
+        pass
+
+    try:
+        goals = database.list_goals('team', owner_name=owner_name,
+                                    today=today) if scope == 'team' else database.list_goals('gosb', today=today)
+    except Exception:
+        goals = []
+
+    title = 'Лучшие сотрудники — Цели ГОСБ' if scope == 'gosb' else f"Лучшие сотрудники — Цели команды ({owner_name})"
+    lines = [title + ':']
+
+    kb = []
+    if not goals:
+        lines.append('Пока нет целей.')
+    else:
+        for g in goals:
+            try:
+                n = database.get_goal_leaderboard_top_n(int(g.get('id')))
+            except Exception:
+                n = 0
+            status = f"ТОП: {n}" if n else 'ТОП: выкл'
+            lines.append(f"#{g.get('id')} {g.get('title', '')} — {status}")
+            kb.append([InlineKeyboardButton(f"⚙️ #{g.get('id')}", callback_data=f"lb_cfg_{scope}_{g.get('id')}")])
+
+    kb.append([InlineKeyboardButton('⬅️ Назад', callback_data=back_cb)])
+    await send_or_edit(target, "\n".join(lines).strip(), reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def show_leaderboard_goal_config(target, uid: int, scope: str, goal_id: int, owner_name: str = None):
+    try:
+        g = database.get_goal(int(goal_id))
+    except Exception:
+        g = None
+    if not g:
+        await send_or_edit(target, 'Цель не найдена.')
+        return
+
+    try:
+        n = database.get_goal_leaderboard_top_n(int(goal_id))
+    except Exception:
+        n = 0
+
+    title = g.get('title', '')
+    cur = f"Текущее значение ТОП: {n}" if n else 'ТОП сейчас отключён'
+    txt = f"""Настройка лучших сотрудников для цели #{goal_id}:
+
+{title}
+
+{cur}
+
+Выберите, сколько сотрудников показывать под этой целью в /start (0 = отключить)."""
+
+    back_to = 'gosb_leaderboards_menu' if scope == 'gosb' else 'team_leaderboards_menu'
+
+    kb = [
+        [InlineKeyboardButton('3', callback_data=f'lb_setn_{scope}_{goal_id}_3'),
+         InlineKeyboardButton('5', callback_data=f'lb_setn_{scope}_{goal_id}_5'),
+         InlineKeyboardButton('10', callback_data=f'lb_setn_{scope}_{goal_id}_10')],
+        [InlineKeyboardButton('✏️ Ввести число', callback_data=f'lb_enter_{scope}_{goal_id}')],
+        [InlineKeyboardButton('🚫 Отключить ТОП', callback_data=f'lb_off_{scope}_{goal_id}')],
+        [InlineKeyboardButton('⬅️ Назад', callback_data=back_to)]
+    ]
+
+    await send_or_edit(target, txt, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def show_goals_menu(target, uid: int, scope: str, owner_name: str = None, back_cb: str = 'return_to_menu'):
+    today = _today_iso()
+    try:
+        database.cleanup_expired_goals(today)
+    except Exception:
+        pass
+
+    try:
+        goals = database.list_goals('team', owner_name=owner_name,
+                                    today=today) if scope == 'team' else database.list_goals('gosb', today=today)
+    except Exception:
+        goals = []
+
+    title = 'Цели ГОСБ' if scope == 'gosb' else f"Цели команды ({owner_name})"
+    lines = [title + ':']
+
+    kb = []
+    if not goals:
+        lines.append('Пока нет целей.')
+    else:
+        for g in goals:
+            achieved = _compute_goal_achieved(g, today)
+            metric = _metric_label(g.get('metric_type'), g.get('metric_key'))
+            due = _iso_to_ru(g.get('date_to'))
+            a = config.format_value(achieved)
+            t = config.format_value(_to_float(g.get('target_value')))
+            lines.append((f'''
+#{g['id']} {g.get('title', '')}
+• Показатель: {metric}
+• Прогресс: {a}/{t}
+• Срок: до {due}''').strip())
+            kb.append([
+                InlineKeyboardButton(f"✏️ #{g['id']}", callback_data=f"goal_edit_{scope}_{g['id']}"),
+                InlineKeyboardButton('🗑', callback_data=f"goal_del_{scope}_{g['id']}")
+            ])
+
+    kb.append([InlineKeyboardButton('➕ Добавить цель', callback_data=f"goal_add_{scope}")])
+    if scope == 'team':
+        kb.append([InlineKeyboardButton('🏆 Лучшие сотрудники', callback_data='team_leaderboards_menu')])
+    kb.append([InlineKeyboardButton('⬅️ Назад', callback_data=back_cb)])
+
+    await send_or_edit(target, "\n\n".join(lines).strip(), reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def show_goal_edit_menu(target, uid: int, scope: str, goal_id: int, owner_name: str = None):
+    try:
+        g = database.get_goal(int(goal_id))
+    except Exception:
+        g = None
+    if not g:
+        await send_or_edit(target, 'Цель не найдена.')
+        return
+
+    today = _today_iso()
+    achieved = _compute_goal_achieved(g, today)
+
+    metric = _metric_label(g.get('metric_type'), g.get('metric_key'))
+    due = _iso_to_ru(g.get('date_to'))
+    frm = _iso_to_ru(g.get('date_from'))
+    a = config.format_value(achieved)
+    t = config.format_value(_to_float(g.get('target_value')))
+
+    text_msg = f"""Редактирование цели #{g['id']}:
+
+Название: {g.get('title', '')}
+Показатель: {metric}
+Цель: {t}
+Период: {frm} — {due}
+Прогресс: {a}/{t}"""
+
+    kb = [
+        [InlineKeyboardButton('✏️ Название', callback_data=f"goal_editfield_{scope}_{g['id']}_title")],
+        [InlineKeyboardButton('🔗 Показатель', callback_data=f"goal_editfield_{scope}_{g['id']}_metric")],
+        [InlineKeyboardButton('🎯 Цель (число)', callback_data=f"goal_editfield_{scope}_{g['id']}_target")],
+        [InlineKeyboardButton('📅 Дата начала', callback_data=f"goal_editfield_{scope}_{g['id']}_date_from")],
+        [InlineKeyboardButton('📅 Дата окончания', callback_data=f"goal_editfield_{scope}_{g['id']}_date_to")],
+        [InlineKeyboardButton('🗑 Удалить', callback_data=f"goal_del_{scope}_{g['id']}")],
+        [InlineKeyboardButton('⬅️ Назад', callback_data=f"{scope}_goals_menu")]
+    ]
+    await send_or_edit(target, text_msg, reply_markup=InlineKeyboardMarkup(kb))
 
 
 # -----------------------------
@@ -1054,8 +1754,8 @@ async def show_admin_questions_editor(target):
     kb = []
     for i, q in enumerate(questions):
         q_key = q.get('key')
-        label = (q.get('question') or '').strip() or f'Вопрос {i+1}'
-        kb.append([InlineKeyboardButton(f"{i+1}. {label}"[:64], callback_data='noop')])
+        label = (q.get('question') or '').strip() or f'Вопрос {i + 1}'
+        kb.append([InlineKeyboardButton(f"{i + 1}. {label}"[:64], callback_data='noop')])
         # Важно: в callback_data передаём именно ключ вопроса (а не индекс),
         # чтобы редактирование/удаление/перемещение работали корректно.
         kb.append([
@@ -1069,7 +1769,6 @@ async def show_admin_questions_editor(target):
     kb.append([InlineKeyboardButton("⬅️ Назад", callback_data='admin_menu')])
 
     await send_or_edit(target, "Вопросы отчёта МКК:", reply_markup=InlineKeyboardMarkup(kb))
-
 
 
 def get_fckp_options():
@@ -1086,6 +1785,7 @@ def get_fckp_options():
         pass
     return list(getattr(config, "FCKP_OPTIONS", []))
 
+
 def save_fckp_options(opts: list):
     opts = [str(x).strip() for x in (opts or []) if str(x).strip()]
     database.set_setting("fckp_options", json.dumps(opts, ensure_ascii=False))
@@ -1093,13 +1793,14 @@ def save_fckp_options(opts: list):
     config.FCKP_OPTIONS = opts
     return opts
 
+
 async def show_admin_fckp_editor(target):
     opts = get_fckp_options()
     kb = []
     if not opts:
         kb.append([InlineKeyboardButton("Пока нет кнопок ЦКП", callback_data="admin_edit_fckp")])
     for i, opt in enumerate(opts):
-        kb.append([InlineKeyboardButton(f"{i+1}. {opt}", callback_data="admin_edit_fckp")])
+        kb.append([InlineKeyboardButton(f"{i + 1}. {opt}", callback_data="admin_edit_fckp")])
         kb.append([
             InlineKeyboardButton("✏️", callback_data=f"admin_fckp_edit_{i}"),
             InlineKeyboardButton("🗑️", callback_data=f"admin_fckp_del_{i}"),
@@ -1118,8 +1819,8 @@ async def show_admin_rtps_editor(target):
 
     kb = []
     for i, fi in enumerate(rtps):
-        label = (fi or '').strip() or f'РТП {i+1}'
-        kb.append([InlineKeyboardButton(f"{i+1}. {label}"[:64], callback_data='noop')])
+        label = (fi or '').strip() or f'РТП {i + 1}'
+        kb.append([InlineKeyboardButton(f"{i + 1}. {label}"[:64], callback_data='noop')])
         kb.append([
             InlineKeyboardButton("✏️", callback_data=f"admin_rtp_edit_{i}"),
             InlineKeyboardButton("🗑", callback_data=f"admin_rtp_del_{i}")
@@ -1138,10 +1839,11 @@ async def show_admin_employees_rtp_selector(target):
 
     kb = []
     for i, fi in enumerate(rtps):
-        kb.append([InlineKeyboardButton((fi or f"РТП {i+1}")[:64], callback_data=f"admin_emp_rtp_{i}")])
+        kb.append([InlineKeyboardButton((fi or f"РТП {i + 1}")[:64], callback_data=f"admin_emp_rtp_{i}")])
 
     kb.append([InlineKeyboardButton("⬅️ Назад", callback_data='admin_menu')])
-    await send_or_edit(target, "Выберите РТП, чтобы посмотреть/редактировать сотрудников:", reply_markup=InlineKeyboardMarkup(kb))
+    await send_or_edit(target, "Выберите РТП, чтобы посмотреть/редактировать сотрудников:",
+                       reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def show_admin_employees_list(target, rtp_idx: int):
@@ -1150,7 +1852,8 @@ async def show_admin_employees_list(target, rtp_idx: int):
         rtps = list(config.RTP_LIST)
 
     if rtp_idx < 0 or rtp_idx >= len(rtps):
-        await send_or_edit(target, "Некорректный индекс РТП.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data='admin_emp_editor')]]))
+        await send_or_edit(target, "Некорректный индекс РТП.", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data='admin_emp_editor')]]))
         return
 
     rtp_fi = rtps[rtp_idx]
@@ -1183,7 +1886,8 @@ async def show_admin_employee_reassign(target, from_rtp_idx: int, emp_id: int):
 
     kb = []
     for i, fi in enumerate(rtps):
-        kb.append([InlineKeyboardButton((fi or f"РТП {i+1}")[:64], callback_data=f"admin_emp_set_{from_rtp_idx}_{emp_id}_{i}")])
+        kb.append([InlineKeyboardButton((fi or f"РТП {i + 1}")[:64],
+                                        callback_data=f"admin_emp_set_{from_rtp_idx}_{emp_id}_{i}")])
 
     kb.append([InlineKeyboardButton("🔌 Отвязать от РТП", callback_data=f"admin_emp_unbind_{from_rtp_idx}_{emp_id}")])
     kb.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_emp_rtp_{from_rtp_idx}")])
@@ -1228,7 +1932,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb[0].append(InlineKeyboardButton("Отправить руководителю", callback_data='send_report'))
         await msg.reply_text("Действия:", reply_markup=InlineKeyboardMarkup(kb))
         return
-
 
     # Password entry flow for RM (leader password)
     if st.get('mode') == 'awaiting_password_for':
@@ -1298,6 +2001,183 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # -----------------------------
+    # LEADERBOARD text-input flows
+    # -----------------------------
+    if st.get('mode') == 'lb_input_n':
+        if text.lower() in ('отмена', 'cancel'):
+            scope = st.get('lb_scope')
+            gid = st.get('lb_goal_id')
+            st['mode'] = 'idle'
+            await show_leaderboard_goal_config(msg, uid, scope=scope, goal_id=int(gid))
+            return
+        try:
+            n = int(text.strip())
+        except Exception:
+            await msg.reply_text('Введите целое число, например 5. Или напишите: отмена')
+            return
+        if n < 0:
+            await msg.reply_text('Число не может быть отрицательным. Или напишите: отмена')
+            return
+        if n > 50:
+            await msg.reply_text('Слишком большое число. Максимум 50. Или напишите: отмена')
+            return
+        scope = st.get('lb_scope')
+        gid = int(st.get('lb_goal_id'))
+        try:
+            database.set_goal_leaderboard(gid, n)
+        except Exception as e:
+            await msg.reply_text(f'Ошибка сохранения: {e}')
+            return
+        st['mode'] = 'idle'
+        await show_leaderboard_goal_config(msg, uid, scope=scope, goal_id=gid)
+        return
+
+    # -----------------------------
+    # GOAL text-input flows
+    # -----------------------------
+    if st.get('mode', '').startswith('goal_'):
+        if text.lower() in ('отмена', 'cancel'):
+            scope = st.get('goal_scope')
+            if scope == 'team':
+                owner = database.get_user_name(uid)
+                await show_goals_menu(msg, uid, scope='team', owner_name=owner, back_cb='rtp_menu')
+            else:
+                await show_goals_menu(msg, uid, scope='gosb', back_cb='rm_management')
+            return
+
+        mode = st.get('mode')
+
+        if mode == 'goal_add_title':
+            st['goal_title'] = text.strip()
+            st['mode'] = 'goal_pick_metric'
+            st['goal_action'] = 'add'
+            await msg.reply_text('Выберите показатель:', reply_markup=_metric_picker_keyboard())
+            return
+
+        if mode == 'goal_add_target':
+            t = text.replace(',', '.').strip()
+            try:
+                val = float(t)
+            except Exception:
+                await msg.reply_text('Введите число, например 30')
+                return
+            st['goal_target'] = val
+            st['mode'] = 'goal_add_date_from'
+            await msg.reply_text("Введите дату начала (ДД.ММ.ГГГГ) или 'сегодня':")
+            return
+
+        if mode == 'goal_add_date_from':
+            try:
+                d_from = _parse_date_to_iso(text)
+            except Exception:
+                await msg.reply_text('Не понял дату. Пример: 20.02.2026')
+                return
+            st['goal_date_from'] = d_from
+            st['mode'] = 'goal_add_date_to'
+            await msg.reply_text('Введите дату окончания (ДД.ММ.ГГГГ):')
+            return
+
+        if mode == 'goal_add_date_to':
+            try:
+                d_to = _parse_date_to_iso(text)
+            except Exception:
+                await msg.reply_text('Не понял дату. Пример: 20.02.2026')
+                return
+            d_from = st.get('goal_date_from')
+            if d_from and d_to < d_from:
+                await msg.reply_text('Дата окончания не может быть раньше даты начала. Введите снова:')
+                return
+            scope = st.get('goal_scope')
+            owner = st.get('goal_owner') if scope == 'team' else None
+            try:
+                database.add_goal(
+                    scope=scope,
+                    owner_name=owner,
+                    title=st.get('goal_title'),
+                    metric_type=st.get('goal_metric_type'),
+                    metric_key=st.get('goal_metric_key'),
+                    target_value=st.get('goal_target', 0),
+                    date_from=d_from or _today_iso(),
+                    date_to=d_to,
+                )
+            except Exception as e:
+                await msg.reply_text(f'Ошибка создания цели: {e}')
+                return
+
+            if scope == 'team':
+                owner = database.get_user_name(uid)
+                await show_goals_menu(msg, uid, scope='team', owner_name=owner, back_cb='rtp_menu')
+            else:
+                await show_goals_menu(msg, uid, scope='gosb', back_cb='rm_management')
+            return
+
+        if mode == 'goal_edit_title':
+            gid = st.get('goal_id')
+            try:
+                database.update_goal(int(gid), title=text.strip())
+            except Exception:
+                pass
+            await show_goal_edit_menu(msg, uid, scope=st.get('goal_scope'), goal_id=gid,
+                                      owner_name=st.get('goal_owner'))
+            return
+
+        if mode == 'goal_edit_target':
+            gid = st.get('goal_id')
+            t = text.replace(',', '.').strip()
+            try:
+                val = float(t)
+            except Exception:
+                await msg.reply_text('Введите число, например 30')
+                return
+            try:
+                database.update_goal(int(gid), target_value=val)
+            except Exception:
+                pass
+            await show_goal_edit_menu(msg, uid, scope=st.get('goal_scope'), goal_id=gid,
+                                      owner_name=st.get('goal_owner'))
+            return
+
+        if mode == 'goal_edit_date_from':
+            gid = st.get('goal_id')
+            try:
+                d_from = _parse_date_to_iso(text)
+            except Exception:
+                await msg.reply_text('Не понял дату. Пример: 20.02.2026')
+                return
+            g = database.get_goal(int(gid)) or {}
+            d_to = g.get('date_to')
+            if d_to and d_to < d_from:
+                await msg.reply_text('Дата начала не может быть позже даты окончания. Введите снова:')
+                return
+            try:
+                database.update_goal(int(gid), date_from=d_from)
+            except Exception:
+                pass
+            await show_goal_edit_menu(msg, uid, scope=st.get('goal_scope'), goal_id=gid,
+                                      owner_name=st.get('goal_owner'))
+            return
+
+        if mode == 'goal_edit_date_to':
+            gid = st.get('goal_id')
+            try:
+                d_to = _parse_date_to_iso(text)
+            except Exception:
+                await msg.reply_text('Не понял дату. Пример: 20.02.2026')
+                return
+            g = database.get_goal(int(gid)) or {}
+            d_from = g.get('date_from')
+            if d_from and d_to < d_from:
+                await msg.reply_text('Дата окончания не может быть раньше даты начала. Введите снова:')
+                return
+            try:
+                database.update_goal(int(gid), date_to=d_to)
+            except Exception:
+                pass
+            await show_goal_edit_menu(msg, uid, scope=st.get('goal_scope'), goal_id=gid,
+                                      owner_name=st.get('goal_owner'))
+            return
+
+    # -----------------------------
     # ADMIN text-input flows
     # -----------------------------
     if st.get('mode') == 'admin_questions_add':
@@ -1348,7 +2228,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_rtps_editor(msg)
         return
 
-
     if st.get('mode') == 'admin_fckp_add':
         opts = get_fckp_options()
         opts.append(text.strip())
@@ -1367,7 +2246,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_fckp_editor(msg)
         return
 
-
     if st.get('mode') == 'admin_set_rtp_password':
         try:
             ok = database.set_rtp_password(text)
@@ -1384,7 +2262,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Registration flows (MKK name entering)
     if st.get('entering_name'):
         name = text
-        role = st.get('mode','idle')
+        role = st.get('mode', 'idle')
         st['name'] = name
         st.pop('entering_name', None)
         database.add_user(uid, 'mkk' if role == 'mkk' else role, name)
@@ -1422,14 +2300,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             n = int(val)
 
             # If editing and count is unchanged, offer keep/reselect products
-            existing = st.get('fckp_products') if isinstance(st.get('fckp_products'), list) else st.get('data', {}).get('fckp_products', [])
+            existing = st.get('fckp_products') if isinstance(st.get('fckp_products'), list) else st.get('data', {}).get(
+                'fckp_products', [])
             if st.get('editing') and isinstance(existing, list) and existing and len(existing) == n and n > 0:
                 st['pending_fckp_n'] = n
                 kb = [[
                     InlineKeyboardButton("Оставить текущие", callback_data="edit_fckp_keep"),
                     InlineKeyboardButton("Выбрать заново", callback_data="edit_fckp_reselect")
                 ]]
-                await msg.reply_text("Количество ФЦКП не изменилось. Оставить текущий список продуктов?", reply_markup=InlineKeyboardMarkup(kb))
+                await msg.reply_text("Количество ФЦКП не изменилось. Оставить текущий список продуктов?",
+                                     reply_markup=InlineKeyboardMarkup(kb))
                 return
 
             st['data'][q['key']] = n
@@ -1437,7 +2317,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 st['fckp_left'] = n
                 st['fckp_products'] = []
                 kb = [[InlineKeyboardButton(p, callback_data=f"fckp_prod_{p}")] for p in config.FCKP_OPTIONS]
-                await msg.reply_text(f"Вы указали {n} ФЦКП. Выберите оформленный продукт (1/{n}):", reply_markup=InlineKeyboardMarkup(kb))
+                await msg.reply_text(f"Вы указали {n} ФЦКП. Выберите оформленный продукт (1/{n}):",
+                                     reply_markup=InlineKeyboardMarkup(kb))
                 return
             else:
                 # clear products
@@ -1456,6 +2337,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Опрос завершён. Для возврата в меню нажмите 'Вернуться в меню' или /start.")
         return
 
+
 async def ask_next_question(msgobj, uid):
     st = safe_state(uid)
     step = st.get('step', 0)
@@ -1472,6 +2354,7 @@ async def ask_next_question(msgobj, uid):
     else:
         await finish_report(msgobj, uid)
 
+
 async def start_filling(query_or_message, uid, editing=False):
     st = safe_state(uid)
     st['editing'] = editing
@@ -1486,6 +2369,7 @@ async def start_filling(query_or_message, uid, editing=False):
         except Exception:
             pass
     await ask_next_question(query_or_message, uid)
+
 
 async def start_edit_report(query_or_message, uid):
     """Start step-by-step editing of the saved report for today."""
@@ -1503,9 +2387,9 @@ async def start_edit_report(query_or_message, uid):
         st.pop('fckp_products', None)
     st.pop('fckp_left', None)
 
-    await send_or_edit(query_or_message, "Редактирование отчёта. Введите значения по пунктам (можно оставить прежнее, введя то же число).")
+    await send_or_edit(query_or_message,
+                       "Редактирование отчёта. Введите значения по пунктам (можно оставить прежнее, введя то же число).")
     await ask_next_question(query_or_message, uid)
-
 
 
 async def finish_report(msgobj, uid):
@@ -1541,6 +2425,7 @@ async def finish_report(msgobj, uid):
     except Exception:
         pass
 
+
 async def send_personal_report_to_manager(uid, context):
     date = datetime.now().strftime('%Y-%m-%d')
     rpt = database.get_report(uid, date)
@@ -1561,14 +2446,17 @@ async def send_personal_report_to_manager(uid, context):
         print("send_personal_report_to_manager error:", e)
         return False, "Ошибка отправки"
 
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("Error:", context.error)
+
 
 async def set_commands(app):
     try:
         await app.bot.set_my_commands([BotCommand("start", "Начать работу с ботом")])
     except Exception as e:
         print("set_commands error:", e)
+
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
