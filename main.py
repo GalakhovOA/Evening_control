@@ -72,7 +72,7 @@ def build_main_menu():
         [InlineKeyboardButton("👤 РТП", callback_data='role_rtp')],
         [InlineKeyboardButton("🏢 УПМБ", callback_data='role_rm')],
         [InlineKeyboardButton("🛠 Администрирование", callback_data='role_admin')],
-        [InlineKeyboardButton("Сменить ФИ/РТП", callback_data='change_info')]
+        [InlineKeyboardButton("✏️ Сменить ФИ/РТП", callback_data='change_info')]
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -498,12 +498,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith('goal_editfield_'):
+        # callback_data format: goal_editfield_{scope}_{goal_id}_{field}
+        # field may contain underscores (e.g. date_from/date_to) — join tail back.
         parts = data.split('_')
         if len(parts) < 5:
             return
         scope = parts[2]
         gid = int(parts[3])
-        field = parts[4]
+        field = '_'.join(parts[4:])
         st2 = safe_state(uid)
         st2['goal_scope'] = scope
         st2['goal_id'] = gid
